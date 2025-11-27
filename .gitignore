@@ -125,3 +125,6 @@ dmypy.json
 
 # Access keys
 *.pem
+
+# Parquet files
+*.parquet
