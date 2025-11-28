@@ -96,7 +96,7 @@ async def connect_ws(symbol: str):
 async def collect_symbol(symbol: str, active_streams: set, buffer: TapeBuffer):
     """Collect trades for a symbol and save parquet files minute-aligned."""
     active_streams.add(symbol)
-    last_minute = None
+    last_hour = None
     try:
         while True:
             try:
@@ -116,10 +116,10 @@ async def collect_symbol(symbol: str, active_streams: set, buffer: TapeBuffer):
 
                     # Minute-aligned write
                     now = datetime.now(timezone.utc)
-                    current_minute = now.minute
-                    if current_minute != last_minute:
+                    current_hour = now.hour
+                    if current_hour != last_hour:
                         await save_parquet(buffer, symbol, now)
-                        last_minute = current_minute
+                        last_hour = current_hour
 
             except Exception as e:
                 logger.warning(f"[DISCONNECT] {symbol} disconnected, reconnecting in 3s → {e}")
