@@ -1,242 +1,198 @@
 import os
-import glob
 import json
 import boto3
-import signal
 import asyncio
 import logging
 import websockets
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 
-# Configuration
+# Default configurations
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 OUT_DIR = os.environ.get("OUT_DIR", "/app/tape")
 S3_BUCKET = os.environ.get("S3_BUCKET", "my-crypto-tape")
 AWS_REGION = os.environ.get("AWS_REGION", "eu-central-1")
-UPLOAD_INTERVAL_SEC = 3600  # hourly upload
-ACTIVE_STREAM_LOG_INTERVAL = 300  # log active streams every 5 min
-SYMBOLS_SOURCE = os.environ.get("SYMBOLS_SOURCE", "local")  # "local" or "s3"
-SYMBOLS_FILE = os.environ.get("SYMBOLS_FILE", "symbols.txt")
-SYMBOLS_BUCKET = os.environ.get("SYMBOLS_BUCKET", "my-symbols-bucket")
-LOGS_BUCKET = os.environ.get("LOGS_BUCKET", "my-logs-bucket")
 LOG_FILE = "/app/logs/collector.log"
+SYMBOLS_FILE = os.environ.get("SYMBOLS_FILE", "symbols.txt")
 
 
-def ensure_path(path):
-    """Ensure a directory exists."""
+# Logging configuration
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+logger = logging.getLogger("collector")
+logger.setLevel(logging.INFO)
+
+fh = logging.FileHandler(LOG_FILE)
+fh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s'))
+logger.addHandler(fh)
+
+sh = logging.StreamHandler()
+sh.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s'))
+logger.addHandler(sh)
+
+
+# UTIL
+def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
 
-# Logging
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-
-logger = logging.getLogger("collector")
-logger.setLevel(logging.INFO)
-logger.propagate = False  # Prevent double logging if root logger exists
-
-console_handler = logging.StreamHandler()
-console_formatter = logging.Formatter(
-    '[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-console_handler.setFormatter(console_formatter)
-logger.addHandler(console_handler)
-
-file_handler = logging.FileHandler(LOG_FILE)
-file_formatter = logging.Formatter(
-    '[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-file_handler.setFormatter(file_formatter)
-logger.addHandler(file_handler)
-
-
-# Utility Functions
 def load_symbols():
-    """
-    Load symbols from local file or S3 depending on SYMBOLS_SOURCE.
-    """
-    if SYMBOLS_SOURCE.lower() == "s3":
-        s3 = boto3.client("s3", region_name=AWS_REGION)
-        obj = s3.get_object(Bucket=SYMBOLS_BUCKET, Key=SYMBOLS_FILE)
-        symbols = obj['Body'].read().decode('utf-8').splitlines()
-        return [s.strip().lower() for s in symbols if s.strip()]
-    else:
-        with open(SYMBOLS_FILE, "r") as f:
-            return [line.strip().lower() for line in f.readlines() if line.strip()]
+    with open(SYMBOLS_FILE, "r") as f:
+        return [s.strip().lower() for s in f.readlines() if s.strip()]
 
 
-# Tape Buffer
-class TapeBuffer:
-    """Stores trades before flushing to Parquet."""
+# Single global buffer for all pairs
+class HourlyTapeBuffer:
     def __init__(self):
         self.records = []
+        self.current_hour = None  # UTC hour currently collecting
 
     def add(self, trade: dict):
+        trade_hour = trade["trade_time"].replace(minute=0, second=0, microsecond=0)
+
+        # On first trade ever
+        if self.current_hour is None:
+            self.current_hour = trade_hour
+
+        # If new hour begins → rotate buffer
+        if trade_hour != self.current_hour:
+            old_hour = self.current_hour
+            old_records = self.records
+            self.records = []
+            self.current_hour = trade_hour
+            return old_hour, old_records
+
+        # Still within same hour
         self.records.append(trade)
+        return None, None
 
-    def flush(self):
+    def force_flush(self):
         if not self.records:
-            return None
-        table = pa.Table.from_pylist(self.records)
+            return None, None
+        hour = self.current_hour
+        records = self.records
         self.records = []
-        return table
+        return hour, records
 
 
-# Collector
-async def connect_ws(symbol: str):
+# WebSocket connection and collection
+async def connect(symbol: str):
     url = f"{BINANCE_FUTURES_WS}/{symbol}@aggTrade"
-    logger.info(f"[WS] Connecting to {url}")
+    logger.info(f"[CONNECT] {url}")
     return await websockets.connect(url, ping_interval=20, ping_timeout=20)
 
-async def collect_symbol(symbol: str, active_streams: set, buffer: TapeBuffer):
-    """Collect trades for a symbol and save parquet files minute-aligned."""
-    active_streams.add(symbol)
-    last_hour = None
-    try:
-        while True:
-            try:
-                ws = await connect_ws(symbol)
-                async for msg in ws:
-                    data = json.loads(msg)
-                    trade = {
-                        "event_time": datetime.fromtimestamp(data["E"] / 1000.0, timezone.utc),
-                        "trade_time": datetime.fromtimestamp(data["T"] / 1000.0, timezone.utc),
-                        "symbol": data["s"],
-                        "price": float(data["p"]),
-                        "qty": float(data["q"]),
-                        "is_buyer_maker": data["m"],
-                        "trade_id": data["a"]
-                    }
-                    buffer.add(trade)
 
-                    # Minute-aligned write
-                    now = datetime.now(timezone.utc)
-                    current_hour = now.hour
-                    if current_hour != last_hour:
-                        await save_parquet(buffer, symbol, now)
-                        last_hour = current_hour
+async def collect_symbol(symbol: str, buffer: HourlyTapeBuffer):
+    while True:
+        try:
+            ws = await connect(symbol)
 
-            except Exception as e:
-                logger.warning(f"[DISCONNECT] {symbol} disconnected, reconnecting in 3s → {e}")
-                await asyncio.sleep(3)
-    finally:
-        active_streams.remove(symbol)
+            async for msg in ws:
+                d = json.loads(msg)
+                trade = {
+                    "event_time": datetime.fromtimestamp(d["E"]/1000, timezone.utc),
+                    "trade_time": datetime.fromtimestamp(d["T"]/1000, timezone.utc),
+                    "symbol": d["s"],
+                    "price": float(d["p"]),
+                    "qty": float(d["q"]),
+                    "is_buyer_maker": d["m"],
+                    "trade_id": d["a"],
+                }
+
+                rotated_hour, rotated_records = buffer.add(trade)
+
+                # If hour changed → write old hour file
+                if rotated_hour is not None:
+                    await write_hour_file(rotated_hour, rotated_records)
+                    await upload_hour_to_s3(rotated_hour)
+
+        except Exception as e:
+            logger.warning(f"[DISCONNECT] {symbol} → reconnecting: {e}")
+            await asyncio.sleep(2)
 
 
-# Parquet Writer
-async def save_parquet(buffer: TapeBuffer, symbol: str, timestamp: datetime):
-    """Flush buffer to Parquet partitioned by year/month/day/symbol."""
-    table = buffer.flush()
-    if table is None:
+# Write to parquet locally
+async def write_hour_file(hour: datetime, records: list):
+    if not records:
         return
 
-    year = timestamp.year
-    month = f"{timestamp.month:02d}"
-    day = f"{timestamp.day:02d}"
+    table = pa.Table.from_pylist(records)
 
-    base_path = os.path.join(OUT_DIR, str(year), month, day, symbol)
-    ensure_path(base_path)
+    year = hour.year
+    month = f"{hour.month:02d}"
+    day = f"{hour.day:02d}"
+    hh = f"{hour.hour:02d}"
 
-    filename = os.path.join(base_path, f"tape_{timestamp.strftime('%H%M%S')}.parquet")
-    logger.debug(f"{symbol} → {filename} ({table.num_rows} rows)")
+    path_dir = os.path.join(OUT_DIR, str(year), month, day)
+    ensure_dir(path_dir)
 
-    pq.write_table(table, filename, compression="snappy")
+    file_path = os.path.join(path_dir, f"{hh}.parquet")
+
+    pq.write_table(table, file_path, compression="snappy")
+    logger.info(f"[WRITE] {file_path} ({table.num_rows} rows)")
 
 
-# S3 Upload
-async def upload_to_s3():
-    """Upload Parquet files to S3 hourly."""
+# Write to S3 and delete locally
+async def upload_hour_to_s3(hour: datetime):
     s3 = boto3.client("s3", region_name=AWS_REGION)
+
+    year = hour.year
+    month = f"{hour.month:02d}"
+    day = f"{hour.day:02d}"
+    hh = f"{hour.hour:02d}"
+
+    local_dir = os.path.join(OUT_DIR, str(year), month, day)
+    local_file = os.path.join(local_dir, f"{hh}.parquet")
+
+    if not os.path.exists(local_file):
+        return
+
+    key = f"{year}/{month}/{day}/{hh}.parquet"
+
+    try:
+        s3.upload_file(local_file, S3_BUCKET, key)
+        logger.info(f"[S3] Uploaded {key}")
+        os.remove(local_file)
+    except Exception as e:
+        logger.error(f"[S3 ERROR] {local_file}: {e}")
+
+
+# Alignemtn
+async def hourly_alignment(buffer: HourlyTapeBuffer):
+    """
+    Wait until the next HH:00:00 and flush previous hour.
+    Ensures correct alignment even if no trades occur exactly at the boundary.
+    """
     while True:
-        logger.info("[S3] Starting hourly upload...")
-        uploaded_symbols = set()
-        for filepath in glob.glob(f"{OUT_DIR}/**/*.parquet", recursive=True):
-            s3_key = os.path.relpath(filepath, OUT_DIR)
-            symbol = os.path.basename(os.path.dirname(filepath))
-            try:
-                s3.upload_file(filepath, S3_BUCKET, s3_key)
-                uploaded_symbols.add(symbol)
-                os.remove(filepath)
-            except Exception as e:
-                logger.error(f"[S3 ERROR] Failed to upload {filepath}: {e}")
+        now = datetime.now(timezone.utc)
+        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        wait_seconds = (next_hour - now).total_seconds()
 
-        if uploaded_symbols:
-            logger.info(f"[S3] Uploaded files for {len(uploaded_symbols)} symbols: {', '.join(sorted(uploaded_symbols))}")
-        else:
-            logger.info("[S3] No new files to upload")
+        await asyncio.sleep(wait_seconds)
 
-        await asyncio.sleep(UPLOAD_INTERVAL_SEC)
+        old_hour, records = buffer.force_flush()
+        if old_hour is not None:
+            await write_hour_file(old_hour, records)
+            await upload_hour_to_s3(old_hour)
 
 
-async def upload_logs_to_s3():
-    s3 = boto3.client("s3", region_name=AWS_REGION)
-    while True:
-        if os.path.exists(LOG_FILE):
-            try:
-                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                s3_key = f"collector_{timestamp}.log"
-                s3.upload_file(LOG_FILE, LOGS_BUCKET, s3_key)
-            except Exception as e:
-                logger.error(f"[LOGS S3 ERROR] Failed to upload logs: {e}")
-        await asyncio.sleep(UPLOAD_INTERVAL_SEC)
-
-
-# Active Streams Logger
-async def log_active_streams(active_streams: set):
-    while True:
-        logger.info(f"Currently active streams: {len(active_streams)}")
-        await asyncio.sleep(ACTIVE_STREAM_LOG_INTERVAL)
-
-
-# Main
 async def main():
     symbols = load_symbols()
-    active_streams = set()
-    buffers = {}
+    buffer = HourlyTapeBuffer()
 
-    # Create collector tasks
     tasks = []
-    for symbol in symbols:
-        buffer = TapeBuffer()
-        buffers[symbol] = buffer
-        task = asyncio.create_task(collect_symbol(symbol, active_streams, buffer))
-        tasks.append(task)
 
-    # S3 uploader & active stream logger
-    tasks.append(asyncio.create_task(upload_to_s3()))
-    tasks.append(asyncio.create_task(upload_logs_to_s3()))
-    tasks.append(asyncio.create_task(log_active_streams(active_streams)))
-    
+    # One collector per symbol
+    for sym in symbols:
+        tasks.append(asyncio.create_task(collect_symbol(sym, buffer)))
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
+    # Hourly cut task for perfect HH:00:00 alignment
+    tasks.append(asyncio.create_task(hourly_alignment(buffer)))
 
-    def shutdown():
-        logger.info("[CTRL+C] Stopping gracefully…")
-        stop_event.set()
-
-    loop.add_signal_handler(signal.SIGINT, shutdown)
-    loop.add_signal_handler(signal.SIGTERM, shutdown)
-
-    await stop_event.wait()
-
-    # Cancel tasks
-    for t in tasks:
-        t.cancel()
-
-    # Flush remaining buffers
-    logger.info("Flushing remaining buffers...")
-    for symbol, buffer in buffers.items():
-        await save_parquet(buffer, symbol, datetime.now(timezone.utc))
-
-    logger.info("[EXIT] All tasks stopped.")
+    await asyncio.gather(*tasks)
 
 
-# Entry Point
 if __name__ == "__main__":
     asyncio.run(main())
