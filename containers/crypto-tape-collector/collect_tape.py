@@ -58,26 +58,16 @@ def load_symbols():
 class HourlyTapeBuffer:
     def __init__(self):
         self.records = []
-        self.current_hour = None  # UTC hour currently collecting
+        self.current_hour = None
 
     def add(self, trade: dict):
         trade_hour = trade["trade_time"].replace(minute=0, second=0, microsecond=0)
 
-        # On first trade ever
         if self.current_hour is None:
             self.current_hour = trade_hour
 
-        # If new hour begins → rotate buffer
-        if trade_hour != self.current_hour:
-            old_hour = self.current_hour
-            old_records = self.records
-            self.records = []
-            self.current_hour = trade_hour
-            return old_hour, old_records
-
         # Still within same hour
         self.records.append(trade)
-        return None, None
 
     def force_flush(self):
         if not self.records:
@@ -85,6 +75,7 @@ class HourlyTapeBuffer:
         hour = self.current_hour
         records = self.records
         self.records = []
+        self.current_hour = None
         return hour, records
 
 
@@ -99,7 +90,6 @@ async def collect_symbol(symbol: str, buffer: HourlyTapeBuffer):
     while True:
         try:
             ws = await connect(symbol)
-
             async for msg in ws:
                 d = json.loads(msg)
                 trade = {
@@ -111,23 +101,28 @@ async def collect_symbol(symbol: str, buffer: HourlyTapeBuffer):
                     "is_buyer_maker": d["m"],
                     "trade_id": d["a"],
                 }
-
-                rotated_hour, rotated_records = buffer.add(trade)
-
-                # If hour changed → write old hour file
-                if rotated_hour is not None:
-                    await write_hour_file(rotated_hour, rotated_records)
-                    await upload_hour_to_s3(rotated_hour)
+                buffer.add(trade)
 
         except Exception as e:
             logger.warning(f"[DISCONNECT] {symbol} → reconnecting: {e}")
             await asyncio.sleep(2)
+
+        finally:
+            try:
+                await ws.close()
+            except:
+                pass
 
 
 # Write to parquet locally
 async def write_hour_file(hour: datetime, records: list):
     if not records:
         return
+
+    # Convert datetime to ISO strings for parquet
+    for r in records:
+        r["event_time"] = r["event_time"].isoformat()
+        r["trade_time"] = r["trade_time"].isoformat()
 
     table = pa.Table.from_pylist(records)
 
@@ -138,7 +133,6 @@ async def write_hour_file(hour: datetime, records: list):
 
     path_dir = os.path.join(OUT_DIR, str(year), month, day)
     ensure_dir(path_dir)
-
     file_path = os.path.join(path_dir, f"{hh}.parquet")
 
     pq.write_table(table, file_path, compression="snappy")
@@ -153,17 +147,16 @@ async def upload_hour_to_s3(hour: datetime):
     month = f"{hour.month:02d}"
     day = f"{hour.day:02d}"
     hh = f"{hour.hour:02d}"
+    timestamp = hour.strftime("%Y-%m-%d_%H:00:00")
 
-    local_dir = os.path.join(OUT_DIR, str(year), month, day)
-    local_file = os.path.join(local_dir, f"{hh}.parquet")
-
+    local_file = os.path.join(OUT_DIR, str(year), month, day, f"{hh}.parquet")
     if not os.path.exists(local_file):
         return
 
-    key = f"{year}/{month}/{day}/{hh}.parquet"
-
+    key = f"{year}/{month}/{day}/{hh}/{timestamp}.parquet"
     try:
-        s3.upload_file(local_file, S3_BUCKET, key)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, s3.upload_file, local_file, S3_BUCKET, key)
         logger.info(f"[S3] Uploaded {key}")
         os.remove(local_file)
     except Exception as e:
@@ -172,19 +165,14 @@ async def upload_hour_to_s3(hour: datetime):
 
 # Alignemtn
 async def hourly_alignment(buffer: HourlyTapeBuffer):
-    """
-    Wait until the next HH:00:00 and flush previous hour.
-    Ensures correct alignment even if no trades occur exactly at the boundary.
-    """
     while True:
         now = datetime.now(timezone.utc)
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         wait_seconds = (next_hour - now).total_seconds()
-
         await asyncio.sleep(wait_seconds)
 
         old_hour, records = buffer.force_flush()
-        if old_hour is not None:
+        if old_hour is not None and records:
             await write_hour_file(old_hour, records)
             await upload_hour_to_s3(old_hour)
 
@@ -195,15 +183,14 @@ async def main():
 
     tasks = []
 
-    # One collector per symbol
+    # Collector per symbol
     for sym in symbols:
         tasks.append(asyncio.create_task(collect_symbol(sym, buffer)))
 
-    # Hourly cut task for perfect HH:00:00 alignment
+    # Hourly alignment flush
     tasks.append(asyncio.create_task(hourly_alignment(buffer)))
 
     await asyncio.gather(*tasks)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
