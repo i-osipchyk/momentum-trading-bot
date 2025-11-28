@@ -16,6 +16,8 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "my-crypto-tape")
 AWS_REGION = os.environ.get("AWS_REGION", "eu-central-1")
 LOG_FILE = "/app/logs/collector.log"
 SYMBOLS_FILE = os.environ.get("SYMBOLS_FILE", "symbols.txt")
+SYMBOLS_SOURCE = os.environ.get("SYMBOLS_SOURCE", "local")
+SYMBOLS_BUCKET = os.environ.get("SYMBOLS_BUCKET", "my-symbols-bucket")
 
 
 # Logging configuration
@@ -39,8 +41,17 @@ def ensure_dir(path):
 
 
 def load_symbols():
-    with open(SYMBOLS_FILE, "r") as f:
-        return [s.strip().lower() for s in f.readlines() if s.strip()]
+    """
+    Load symbols from local file or S3 depending on SYMBOLS_SOURCE.
+    """
+    if SYMBOLS_SOURCE.lower() == "s3":
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        obj = s3.get_object(Bucket=SYMBOLS_BUCKET, Key=SYMBOLS_FILE)
+        symbols = obj['Body'].read().decode('utf-8').splitlines()
+        return [s.strip().lower() for s in symbols if s.strip()]
+    else:
+        with open(SYMBOLS_FILE, "r") as f:
+            return [line.strip().lower() for line in f.readlines() if line.strip()]
 
 
 # Single global buffer for all pairs
