@@ -56,27 +56,79 @@ def load_symbols():
 
 # Single global buffer for all pairs
 class HourlyTapeBuffer:
-    def __init__(self):
-        self.records = []
+    def __init__(self, out_dir: str, s3_bucket: str, aws_region: str):
         self.current_hour = None
+        self.records = []
+        self.OUT_DIR = out_dir
+        self.S3_BUCKET = s3_bucket
+        self.AWS_REGION = aws_region
+        self.s3 = boto3.client("s3", region_name=self.AWS_REGION)
 
-    def add(self, trade: dict):
+    # Ensure directory exists
+    def ensure_dir(self, path):
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+    # Add a trade
+    async def add(self, trade: dict):
         trade_hour = trade["trade_time"].replace(minute=0, second=0, microsecond=0)
 
+        # First trade
         if self.current_hour is None:
             self.current_hour = trade_hour
 
-        # Still within same hour
+        # Hour change detected → flush previous hour
+        if trade_hour != self.current_hour:
+            await self._flush_to_s3(self.current_hour, self.records)
+            self.records = []
+            self.current_hour = trade_hour
+
+        # Add new trade to current hour
         self.records.append(trade)
 
-    def force_flush(self):
-        if not self.records:
-            return None, None
-        hour = self.current_hour
-        records = self.records
-        self.records = []
-        self.current_hour = None
-        return hour, records
+    # Internal method: write parquet + upload S3
+    async def _flush_to_s3(self, hour: datetime, records: list):
+        if not records:
+            return
+
+        # Convert datetimes to ISO strings
+        for r in records:
+            r["event_time"] = r["event_time"].isoformat()
+            r["trade_time"] = r["trade_time"].isoformat()
+
+        table = pa.Table.from_pylist(records)
+
+        # Local path
+        year = hour.year
+        month = f"{hour.month:02d}"
+        day = f"{hour.day:02d}"
+        hh = f"{hour.hour:02d}"
+        path_dir = os.path.join(self.OUT_DIR, str(year), month, day)
+        self.ensure_dir(path_dir)
+        local_file = os.path.join(path_dir, f"{hh}.parquet")
+
+        # Write parquet
+        pq.write_table(table, local_file, compression="snappy")
+        print(f"[WRITE] {local_file} ({table.num_rows} rows)")
+
+        # Upload to S3
+        timestamp = hour.strftime("%Y-%m-%d_%H:00:00")
+        key = f"{year}/{month}/{day}/{hh}/{timestamp}.parquet"
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self.s3.upload_file, local_file, self.S3_BUCKET, key)
+            print(f"[S3] Uploaded {key}")
+            os.remove(local_file)
+        except Exception as e:
+            print(f"[S3 ERROR] {local_file}: {e}")
+
+    # Optional: flush remaining records (e.g., on shutdown)
+    async def flush_remaining(self):
+        if self.records:
+            await self._flush_to_s3(self.current_hour, self.records)
+            self.records = []
+            self.current_hour = None
 
 
 # WebSocket connection and collection
@@ -114,72 +166,13 @@ async def collect_symbol(symbol: str, buffer: HourlyTapeBuffer):
                 pass
 
 
-# Write to parquet locally
-async def write_hour_file(hour: datetime, records: list):
-    if not records:
-        return
-
-    # Convert datetime to ISO strings for parquet
-    for r in records:
-        r["event_time"] = r["event_time"].isoformat()
-        r["trade_time"] = r["trade_time"].isoformat()
-
-    table = pa.Table.from_pylist(records)
-
-    year = hour.year
-    month = f"{hour.month:02d}"
-    day = f"{hour.day:02d}"
-    hh = f"{hour.hour:02d}"
-
-    path_dir = os.path.join(OUT_DIR, str(year), month, day)
-    ensure_dir(path_dir)
-    file_path = os.path.join(path_dir, f"{hh}.parquet")
-
-    pq.write_table(table, file_path, compression="snappy")
-    logger.info(f"[WRITE] {file_path} ({table.num_rows} rows)")
-
-
-# Write to S3 and delete locally
-async def upload_hour_to_s3(hour: datetime):
-    s3 = boto3.client("s3", region_name=AWS_REGION)
-
-    year = hour.year
-    month = f"{hour.month:02d}"
-    day = f"{hour.day:02d}"
-    hh = f"{hour.hour:02d}"
-    timestamp = hour.strftime("%Y-%m-%d_%H:00:00")
-
-    local_file = os.path.join(OUT_DIR, str(year), month, day, f"{hh}.parquet")
-    if not os.path.exists(local_file):
-        return
-
-    key = f"{year}/{month}/{day}/{hh}/{timestamp}.parquet"
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, s3.upload_file, local_file, S3_BUCKET, key)
-        logger.info(f"[S3] Uploaded {key}")
-        os.remove(local_file)
-    except Exception as e:
-        logger.error(f"[S3 ERROR] {local_file}: {e}")
-
-
-# Alignemtn
-async def hourly_alignment(buffer: HourlyTapeBuffer):
-    while True:
-        now = datetime.now(timezone.utc)
-        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        wait_seconds = (next_hour - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-
-        old_hour, records = buffer.force_flush()
-        if old_hour is not None and records:
-            await write_hour_file(old_hour, records)
-            await upload_hour_to_s3(old_hour)
-
-
 async def main():
     symbols = load_symbols()
-    buffer = HourlyTapeBuffer()
+    buffer = HourlyTapeBuffer(
+        out_dir=OUT_DIR,
+        s3_bucket=S3_BUCKET,
+        aws_region=AWS_REGION
+    )
 
     tasks = []
 
@@ -187,9 +180,7 @@ async def main():
     for sym in symbols:
         tasks.append(asyncio.create_task(collect_symbol(sym, buffer)))
 
-    # Hourly alignment flush
-    tasks.append(asyncio.create_task(hourly_alignment(buffer)))
-
+    # Run collectors forever
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
