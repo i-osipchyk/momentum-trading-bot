@@ -93,8 +93,10 @@ class HourlyTapeBuffer:
 
         # Convert datetimes to ISO strings
         for r in records:
-            r["event_time"] = r["event_time"].isoformat()
-            r["trade_time"] = r["trade_time"].isoformat()
+            if isinstance(r["event_time"], datetime):
+                r["event_time"] = r["event_time"].isoformat()
+            if isinstance(r["trade_time"], datetime):
+                r["trade_time"] = r["trade_time"].isoformat()
 
         table = pa.Table.from_pylist(records)
 
