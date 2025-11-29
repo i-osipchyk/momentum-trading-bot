@@ -153,7 +153,7 @@ async def collect_symbol(symbol: str, buffer: HourlyTapeBuffer):
                     "is_buyer_maker": d["m"],
                     "trade_id": d["a"],
                 }
-                buffer.add(trade)
+                await buffer.add(trade)
 
         except Exception as e:
             logger.warning(f"[DISCONNECT] {symbol} → reconnecting: {e}")
