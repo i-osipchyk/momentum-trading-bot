@@ -57,7 +57,6 @@ def load_symbols():
 # Single global buffer for all pairs
 class HourlyTapeBuffer:
     def __init__(self, out_dir: str, s3_bucket: str, aws_region: str):
-        self.current_hour = None
         self.records = []
         self.OUT_DIR = out_dir
         self.S3_BUCKET = s3_bucket
@@ -71,23 +70,26 @@ class HourlyTapeBuffer:
 
     # Add a trade
     async def add(self, trade: dict):
-        trade_hour = trade["trade_time"].replace(minute=0, second=0, microsecond=0)
-
-        # First trade
-        if self.current_hour is None:
-            self.current_hour = trade_hour
-
-        # Hour change detected → flush previous hour
-        if trade_hour != self.current_hour:
-            await self._flush_to_s3(self.current_hour, self.records, 'full')
-            self.records = []
-            self.current_hour = trade_hour
-
-        # Add new trade to current hour
         self.records.append(trade)
 
-    # Internal method: write parquet + upload S3
-    async def _flush_to_s3(self, hour: datetime, records: list, mode: str):
+    # Background task: flush all trades every hour at HH:00:00
+    async def hourly_flush_task(self):
+        while True:
+            now = datetime.now(timezone.utc)
+            # Calculate seconds until the next hour
+            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            sleep_seconds = (next_hour - now).total_seconds()
+            await asyncio.sleep(sleep_seconds)
+
+            # Flush all trades to S3
+            if self.records:
+                flush_hour = next_hour - timedelta(hours=1)  # name file for the previous hour
+                await self._flush_to_s3(flush_hour, self.records)
+                logger.info(f"[FLUSH] Hourly flush executed: {len(self.records)} trades")
+                self.records = []
+
+    # Internal flush method (can reuse your existing flush_to_s3)
+    async def _flush_to_s3(self, hour: datetime, records: list):
         if not records:
             return
 
@@ -108,7 +110,7 @@ class HourlyTapeBuffer:
 
         # Upload to S3
         timestamp = hour.strftime("%Y-%m-%d_%H:00:00")
-        key = f"{year}/{month}/{day}/{hh}/{timestamp}_{mode}.parquet"
+        key = f"{year}/{month}/{day}/{hh}/{timestamp}.parquet"
 
         loop = asyncio.get_running_loop()
         try:
@@ -117,13 +119,6 @@ class HourlyTapeBuffer:
             os.remove(local_file)
         except Exception as e:
             logger.error(f"[S3 ERROR] {local_file}: {e}")
-
-    # Optional: flush remaining records (e.g., on shutdown)
-    async def flush_remaining(self):
-        if self.records:
-            await self._flush_to_s3(self.current_hour, self.records, 'partial')
-            self.records = []
-            self.current_hour = None
 
 
 # WebSocket connection and collection
@@ -169,7 +164,7 @@ async def main():
         aws_region=AWS_REGION
     )
 
-    tasks = []
+    tasks = [asyncio.create_task(buffer.hourly_flush_task())]
 
     # Collector per symbol
     for sym in symbols:
