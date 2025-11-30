@@ -82,18 +82,19 @@ class HourlyTapeBuffer:
             await asyncio.sleep(sleep_seconds)
 
             # Flush all trades to S3
-            if self.records:
-                flush_hour = next_hour - timedelta(hours=1)  # name file for the previous hour
-                await self._flush_to_s3(flush_hour, self.records)
-                logger.info(f"[FLUSH] Hourly flush executed: {len(self.records)} trades")
-                self.records = []
+            flush_hour = next_hour - timedelta(hours=1)  # name file for the previous hour
+            await self._flush_to_s3(flush_hour)
+            logger.info(f"[FLUSH] Hourly flush executed: {len(self.records)} trades")
 
     # Internal flush method (can reuse your existing flush_to_s3)
-    async def _flush_to_s3(self, hour: datetime, records: list):
-        if not records:
+    async def _flush_to_s3(self, hour: datetime):
+        records_to_flush = self.records.copy()
+        self.records = []
+
+        if not records_to_flush:
             return
 
-        table = pa.Table.from_pylist(records)
+        table = pa.Table.from_pylist(records_to_flush)
 
         # Local path
         year = hour.year
