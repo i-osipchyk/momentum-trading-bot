@@ -91,17 +91,7 @@ class HourlyTapeBuffer:
         if not records:
             return
 
-        # Copy records so we don't mutate buffer
-        safe_records = []
-        for r in records:
-            r_copy = r.copy()
-            if isinstance(r_copy["event_time"], datetime):
-                r_copy["event_time"] = r_copy["event_time"].isoformat()
-            if isinstance(r_copy["trade_time"], datetime):
-                r_copy["trade_time"] = r_copy["trade_time"].isoformat()
-            safe_records.append(r_copy)
-
-        table = pa.Table.from_pylist(safe_records)
+        table = pa.Table.from_pylist(records)
 
         # Local path
         year = hour.year
@@ -114,7 +104,7 @@ class HourlyTapeBuffer:
 
         # Write parquet
         pq.write_table(table, local_file, compression="snappy")
-        print(f"[WRITE] {local_file} ({table.num_rows} rows)")
+        logger.info(f"[WRITE] {local_file} ({table.num_rows} rows)")
 
         # Upload to S3
         timestamp = hour.strftime("%Y-%m-%d_%H:00:00")
@@ -123,10 +113,10 @@ class HourlyTapeBuffer:
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(None, self.s3.upload_file, local_file, self.S3_BUCKET, key)
-            print(f"[S3] Uploaded {key}")
+            logger.info(f"[S3] Uploaded {key}")
             os.remove(local_file)
         except Exception as e:
-            print(f"[S3 ERROR] {local_file}: {e}")
+            logger.error(f"[S3 ERROR] {local_file}: {e}")
 
     # Optional: flush remaining records (e.g., on shutdown)
     async def flush_remaining(self):
