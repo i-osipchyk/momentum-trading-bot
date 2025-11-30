@@ -79,7 +79,7 @@ class HourlyTapeBuffer:
 
         # Hour change detected → flush previous hour
         if trade_hour != self.current_hour:
-            await self._flush_to_s3(self.current_hour, self.records)
+            await self._flush_to_s3(self.current_hour, self.records, 'full')
             self.records = []
             self.current_hour = trade_hour
 
@@ -87,18 +87,21 @@ class HourlyTapeBuffer:
         self.records.append(trade)
 
     # Internal method: write parquet + upload S3
-    async def _flush_to_s3(self, hour: datetime, records: list):
+    async def _flush_to_s3(self, hour: datetime, records: list, mode: str):
         if not records:
             return
 
-        # Convert datetimes to ISO strings
+        # Copy records so we don't mutate buffer
+        safe_records = []
         for r in records:
-            if isinstance(r["event_time"], datetime):
-                r["event_time"] = r["event_time"].isoformat()
-            if isinstance(r["trade_time"], datetime):
-                r["trade_time"] = r["trade_time"].isoformat()
+            r_copy = r.copy()
+            if isinstance(r_copy["event_time"], datetime):
+                r_copy["event_time"] = r_copy["event_time"].isoformat()
+            if isinstance(r_copy["trade_time"], datetime):
+                r_copy["trade_time"] = r_copy["trade_time"].isoformat()
+            safe_records.append(r_copy)
 
-        table = pa.Table.from_pylist(records)
+        table = pa.Table.from_pylist(safe_records)
 
         # Local path
         year = hour.year
@@ -115,7 +118,7 @@ class HourlyTapeBuffer:
 
         # Upload to S3
         timestamp = hour.strftime("%Y-%m-%d_%H:00:00")
-        key = f"{year}/{month}/{day}/{hh}/{timestamp}.parquet"
+        key = f"{year}/{month}/{day}/{hh}/{timestamp}_{mode}.parquet"
 
         loop = asyncio.get_running_loop()
         try:
@@ -128,7 +131,7 @@ class HourlyTapeBuffer:
     # Optional: flush remaining records (e.g., on shutdown)
     async def flush_remaining(self):
         if self.records:
-            await self._flush_to_s3(self.current_hour, self.records)
+            await self._flush_to_s3(self.current_hour, self.records, 'partial')
             self.records = []
             self.current_hour = None
 
