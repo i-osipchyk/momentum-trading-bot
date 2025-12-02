@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 
 
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
-OUT_DIR = os.environ.get("OUT_DIR", "/app/tape")
+OUT_DIR = os.environ.get("OUT_DIR", "/app/L2")
 S3_BUCKET = os.environ.get("S3_BUCKET", "crypto-tape-collector-symbols")
 AWS_REGION = os.environ.get("AWS_REGION", "eu-central-1")
 LOG_FILE = "/app/logs/collector.log"
@@ -33,7 +33,7 @@ def load_symbols():
         return [line.strip().lower() for line in f.readlines() if line.strip()]
 
 
-class HourlyTapeBuffer:
+class HourlyL2Buffer:
     def __init__(self, out_dir: str, s3_bucket: str, aws_region: str):
         self.records = []
         self.OUT_DIR = out_dir
@@ -102,7 +102,7 @@ async def connect(symbol: str):
     return await websockets.connect(url, ping_interval=20, ping_timeout=20)
 
 
-async def collect_depth(symbol: str, buffer: HourlyTapeBuffer):
+async def collect_depth(symbol: str, buffer: HourlyL2Buffer):
     """
     Collects market depth snapshots every 0.5 seconds.
     """
@@ -148,7 +148,7 @@ async def collect_depth(symbol: str, buffer: HourlyTapeBuffer):
 
 async def main():
     symbols = load_symbols()
-    buffer = HourlyTapeBuffer(OUT_DIR, S3_BUCKET, AWS_REGION)
+    buffer = HourlyL2Buffer(OUT_DIR, S3_BUCKET, AWS_REGION)
 
     tasks = [asyncio.create_task(buffer.quarter_hour_flush_task())]
     for sym in symbols:
