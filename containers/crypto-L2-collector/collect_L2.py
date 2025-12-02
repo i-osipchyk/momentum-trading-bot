@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 
 
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
-OUT_DIR = os.environ.get("OUT_DIR", "/app/L2")
+OUT_DIR = os.environ.get("OUT_DIR", "/app/l2")
 S3_BUCKET = os.environ.get("S3_BUCKET", "crypto-tape-collector-symbols")
 AWS_REGION = os.environ.get("AWS_REGION", "eu-central-1")
 LOG_FILE = "/app/logs/collector.log"

@@ -14,21 +14,21 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy collector script (no need to copy local symbols if reading from S3)
-COPY collect_L2.py .
+COPY collect_l2.py .
 COPY symbols.txt .
 
 # Create directories for Parquet and logs
-RUN mkdir -p /app/L2 /app/logs
+RUN mkdir -p /app/l2 /app/logs
 
 # Environment variables
 ENV SYMBOLS_FILE=symbols.txt
 ENV SYMBOLS_SOURCE=s3
 ENV SYMBOLS_BUCKET=crypto-tape-collector-symbols
-ENV OUT_DIR=/app/L2
-ENV S3_BUCKET=crypto-L2-collector-L2-data
-ENV LOGS_BUCKET=crypto-L2-collector-logs
+ENV OUT_DIR=/app/l2
+ENV S3_BUCKET=crypto-l2-collector-l2-data
+ENV LOGS_BUCKET=crypto-l2-collector-logs
 ENV AWS_REGION=eu-central-1
 ENV PYTHONUNBUFFERED=1
 
 # Run collector
-CMD ["python", "collect_L2.py"]
+CMD ["python", "collect_l2.py"]
