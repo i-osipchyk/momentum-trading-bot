@@ -18,13 +18,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY hod_with_pullback_bot.py .
-COPY hod_breakout_with_pullback ./hod_breakout_with_pullback
+COPY crypto-hod-breakout-bot ./crypto-hod-breakout-bot
 
 # Ensure required directories exist
 RUN mkdir -p \
-    /app/hod_breakout_with_pullback/logs \
-    /app/hod_breakout_with_pullback/alerts \
-    /app/hod_breakout_with_pullback/trades
+    /app/rypto-hod-breakout-bot/logs \
+    /app/rypto-hod-breakout-bot/alerts \
+    /app/rypto-hod-breakout-bot/trades
 
 # Environment
 ENV PYTHONUNBUFFERED=1
