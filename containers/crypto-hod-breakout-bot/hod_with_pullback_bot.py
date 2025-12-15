@@ -21,24 +21,24 @@ MAX_KLINES = 21
 AVG_VOL_WINDOW = 10
 MIN_PULLBACK_DURATION = timedelta(minutes=30)
 
-JSON_ALERTS_PATH = f'hod_breakout_with_pullback/alerts/hod_breakout_trades_{datetime.now(timezone.utc)}.json'.replace(" ", "_").replace(":", "-")
+JSON_ALERTS_PATH = f'alerts/hod_breakout_trades_{datetime.now(timezone.utc)}.json'.replace(" ", "_").replace(":", "-")
 JSON_ALERTS_FILE = Path(JSON_ALERTS_PATH)
 JSON_ALERTS_FILE.parent.mkdir(parents=True, exist_ok=True)
 JSON_ALERTS_FILE_LOCK = asyncio.Lock()
 
-JSON_TRADES_PATH = f'hod_breakout_with_pullback/trades/hod_breakout_trades_{datetime.now(timezone.utc)}.json'.replace(" ", "_").replace(":", "-")
+JSON_TRADES_PATH = f'trades/hod_breakout_trades_{datetime.now(timezone.utc)}.json'.replace(" ", "_").replace(":", "-")
 JSON_TRADES_FILE = Path(JSON_TRADES_PATH)
 JSON_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
 JSON_TRADES_FILE_LOCK = asyncio.Lock()
 
-SYMBOLS_FILE = 'hod_breakout_with_pullback/symbols_full.txt'
+SYMBOLS_FILE = 'symbols_full.txt'
 
 with open(SYMBOLS_FILE, "r") as f:
     SYMBOLS = [line.strip().lower() for line in f.readlines() if line.strip()]
 
 
 # ====================== LOGGING =======================
-LOGS_FOLDER_PATH = 'hod_breakout_with_pullback/logs/'
+LOGS_FOLDER_PATH = 'logs/'
 Path(LOGS_FOLDER_PATH).mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
